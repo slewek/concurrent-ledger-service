@@ -3,6 +3,7 @@ package dev.challenge.ledger.service;
 import dev.challenge.ledger.concurrency.AccountLockManager;
 import dev.challenge.ledger.domain.EntryType;
 import dev.challenge.ledger.domain.TransferStatus;
+import dev.challenge.ledger.idempotency.InMemoryIdempotencyStore;
 import dev.challenge.ledger.storage.InMemoryAccountStore;
 import dev.challenge.ledger.storage.InMemoryLedgerEntryStore;
 import org.junit.jupiter.api.BeforeEach;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,7 +37,8 @@ class LedgerServiceTest {
         ledgerService = new LedgerService(
                 accountStore,
                 ledgerEntryStore,
-                new AccountLockManager()
+                new AccountLockManager(),
+                new InMemoryIdempotencyStore()
         );
     }
 
@@ -45,12 +48,16 @@ class LedgerServiceTest {
         var destination = accountStore.create(2_000);
 
         var result = ledgerService.transfer(
+                UUID.randomUUID().toString(),
                 source.id(),
                 destination.id(),
                 3_000
         );
 
-        assertEquals(TransferStatus.SUCCESS, result.status());
+        assertEquals(
+                TransferStatus.SUCCESS,
+                result.status()
+        );
 
         assertEquals(
                 7_000,
@@ -91,6 +98,7 @@ class LedgerServiceTest {
         var destination = accountStore.create(2_000);
 
         var result = ledgerService.transfer(
+                UUID.randomUUID().toString(),
                 source.id(),
                 destination.id(),
                 1_500
@@ -145,6 +153,7 @@ class LedgerServiceTest {
                     start.await();
 
                     return ledgerService.transfer(
+                            UUID.randomUUID().toString(),
                             source.id(),
                             destination.id(),
                             1
@@ -162,7 +171,10 @@ class LedgerServiceTest {
                 }
             }
 
-            assertEquals(100, successfulTransfers);
+            assertEquals(
+                    100,
+                    successfulTransfers
+            );
 
             assertEquals(
                     0,
@@ -201,6 +213,7 @@ class LedgerServiceTest {
 
                             for (int i = 0; i < 1_000; i++) {
                                 ledgerService.transfer(
+                                        UUID.randomUUID().toString(),
                                         accountA.id(),
                                         accountB.id(),
                                         1
@@ -215,6 +228,7 @@ class LedgerServiceTest {
 
                             for (int i = 0; i < 1_000; i++) {
                                 ledgerService.transfer(
+                                        UUID.randomUUID().toString(),
                                         accountB.id(),
                                         accountA.id(),
                                         1
@@ -260,6 +274,7 @@ class LedgerServiceTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ledgerService.transfer(
+                        "invalid-amount",
                         accountAId,
                         accountBId,
                         0
@@ -269,10 +284,100 @@ class LedgerServiceTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> ledgerService.transfer(
+                        "same-account",
                         accountAId,
                         accountAId,
                         100
                 )
+        );
+    }
+
+    @Test
+    void shouldApplyTransferOnlyOnceForRepeatedIdempotencyKey() {
+        var source = accountStore.create(1_000);
+        var destination = accountStore.create(0);
+
+        String key = "transfer-123";
+
+        var first = ledgerService.transfer(
+                key,
+                source.id(),
+                destination.id(),
+                300
+        );
+
+        var retry = ledgerService.transfer(
+                key,
+                source.id(),
+                destination.id(),
+                300
+        );
+
+        assertEquals(first, retry);
+
+        assertEquals(
+                700,
+                accountStore.findById(source.id())
+                        .orElseThrow()
+                        .balance()
+        );
+
+        assertEquals(
+                300,
+                accountStore.findById(destination.id())
+                        .orElseThrow()
+                        .balance()
+        );
+
+        var entries = ledgerEntryStore.findByTransferId(
+                first.transferId()
+        );
+
+        assertEquals(
+                2,
+                entries.size()
+        );
+    }
+
+    @Test
+    void shouldRejectSameIdempotencyKeyForDifferentTransfer() {
+        var source = accountStore.create(1_000);
+        var destination = accountStore.create(0);
+
+        var sourceId = source.id();
+        var destinationId = destination.id();
+
+        String key = "transfer-123";
+
+        ledgerService.transfer(
+                key,
+                sourceId,
+                destinationId,
+                100
+        );
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> ledgerService.transfer(
+                        key,
+                        sourceId,
+                        destinationId,
+                        200
+                )
+        );
+
+        assertEquals(
+                900,
+                accountStore.findById(sourceId)
+                        .orElseThrow()
+                        .balance()
+        );
+
+        assertEquals(
+                100,
+                accountStore.findById(destinationId)
+                        .orElseThrow()
+                        .balance()
         );
     }
 }
